@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
+import os
 
 import scrapy
 from scrapy.http import TextResponse
@@ -91,18 +92,21 @@ class SingleSourceSpider(scrapy.Spider):
         for url in self.start_urls:
             yield self._build_request(
                 url,
-                conditional=True
+                conditional=True,
+                is_seed=True,
             )
 
     def _build_request(
         self,
         url,
-        conditional=False
+        conditional=False,
+        is_seed=False,
+        dont_filter=False,
     ):
         headers = {}
 
         # Conditional headers are used only for the original
-        # seed request. This preserves Week 6 incremental behavior.
+        # seed request. This preserves incremental crawling behavior.
         if conditional:
             if self.etag:
                 headers["If-None-Match"] = self.etag
@@ -115,10 +119,11 @@ class SingleSourceSpider(scrapy.Spider):
             callback=self.parse,
             errback=self.handle_failure,
             headers=headers,
-            dont_filter=False,
+            dont_filter=dont_filter,
             meta={
                 "handle_httpstatus_list": [304],
-                "is_seed": conditional,
+                "is_seed": is_seed,
+                "conditional_request": conditional,
             },
         )
 
@@ -147,7 +152,7 @@ class SingleSourceSpider(scrapy.Spider):
         self,
         url,
         meta,
-        status
+        status,
     ):
         item = CrawlResultItem()
 
@@ -158,7 +163,7 @@ class SingleSourceSpider(scrapy.Spider):
 
         item["network"] = meta.get(
             "network",
-            "clearnet"
+            "clearnet",
         )
 
         item["fetch_timestamp"] = (
@@ -183,6 +188,34 @@ class SingleSourceSpider(scrapy.Spider):
 
         return item
 
+    def _previous_evidence_exists(self):
+        """
+        A 304 response is accepted as unchanged only when
+        both previous evidence files are available.
+        """
+        if not self.prev_hash:
+            return False
+
+        raw_dir = self.settings.get(
+            "RAW_STORAGE_DIR",
+            "crawl_output/raw",
+        )
+
+        html_path = os.path.join(
+            raw_dir,
+            f"{self.prev_hash}.html",
+        )
+
+        text_path = os.path.join(
+            raw_dir,
+            f"{self.prev_hash}.txt",
+        )
+
+        return (
+            os.path.isfile(html_path)
+            and os.path.isfile(text_path)
+        )
+
     def parse(self, response):
         url = self._normalize_url(
             response.url
@@ -191,46 +224,74 @@ class SingleSourceSpider(scrapy.Spider):
         self.pages_seen += 1
         self.visited_urls.add(url)
 
-        item = self._base_item(
-            url,
-            response.meta,
-            "success"
-        )
-
-        item["http_status"] = response.status
-
         # -------------------------------------------------------------- #
-        # Incremental check
+        # 304 incremental response
         # -------------------------------------------------------------- #
         if (
             response.status == 304
             and response.meta.get("is_seed")
         ):
-            item["unchanged"] = True
-            item["content_hash"] = self.prev_hash
-            item["etag"] = self.etag
-            item["last_modified"] = self.last_modified
+            # Accept 304 as unchanged only when both previous
+            # evidence files are still available.
+            if self._previous_evidence_exists():
+                item = self._base_item(
+                    url,
+                    response.meta,
+                    "success",
+                )
 
-            self.logger.info(
-                "Source '%s' unchanged: %s",
+                item["http_status"] = response.status
+                item["unchanged"] = True
+                item["content_hash"] = self.prev_hash
+                item["etag"] = self.etag
+                item["last_modified"] = self.last_modified
+
+                self.logger.info(
+                    "Source '%s' unchanged and previous evidence exists: %s",
+                    self.source_name,
+                    url,
+                )
+
+                yield item
+                return
+
+            # Previous evidence is missing.
+            # Make one unconditional request to restore the evidence.
+            self.logger.warning(
+                "Source '%s' returned 304 but previous evidence is "
+                "missing. Retrying seed request without conditional "
+                "headers: %s",
                 self.source_name,
                 url,
             )
 
-            yield item
+            yield self._build_request(
+                url,
+                conditional=False,
+                is_seed=True,
+                dont_filter=True,
+            )
             return
+
+        item = self._base_item(
+            url,
+            response.meta,
+            "success",
+        )
+
+        item["http_status"] = response.status
 
         # -------------------------------------------------------------- #
         # Response validators
         # -------------------------------------------------------------- #
         item["etag"] = _header(
             response,
-            "ETag"
+            "ETag",
         )
 
         item["last_modified"] = _header(
             response,
-            "Last-Modified"
+            "Last-Modified",
         )
 
         # -------------------------------------------------------------- #
@@ -282,12 +343,16 @@ class SingleSourceSpider(scrapy.Spider):
         # Controlled incremental discovery
         # -------------------------------------------------------------- #
         #
-        # If the seed returned 200, discover additional same-domain
-        # pages. If the seed returned 304, we returned above and do not
-        # reprocess its links.
+        # A successful 200 seed can discover additional same-domain
+        # pages.
+        #
+        # A valid 304 returns above and does not reprocess links.
+        #
+        # A 304 with missing evidence performs one unconditional
+        # seed request. If that request succeeds, it continues
+        # through this normal 200 response path.
         #
         # Only authorized same-domain HTTP(S) links are followed.
-        # External domains are never crawled.
         #
         if self.pages_seen >= self.max_pages:
             return
@@ -301,7 +366,7 @@ class SingleSourceSpider(scrapy.Spider):
 
             next_url = urljoin(
                 response.url,
-                href
+                href,
             )
 
             next_url = self._normalize_url(
@@ -320,7 +385,8 @@ class SingleSourceSpider(scrapy.Spider):
 
             yield self._build_request(
                 next_url,
-                conditional=False
+                conditional=False,
+                is_seed=False,
             )
 
     def handle_failure(self, failure):
@@ -329,7 +395,7 @@ class SingleSourceSpider(scrapy.Spider):
         response = getattr(
             failure.value,
             "response",
-            None
+            None,
         )
 
         http_status = (
@@ -350,13 +416,13 @@ class SingleSourceSpider(scrapy.Spider):
         self.logger.error(
             "Fetch failed permanently for %s: %s",
             request.url,
-            error
+            error,
         )
 
         item = self._base_item(
             request.url,
             request.meta,
-            "failed"
+            "failed",
         )
 
         item["http_status"] = http_status
