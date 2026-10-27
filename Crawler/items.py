@@ -14,6 +14,7 @@ class CrawlResultItem(scrapy.Item):
     url = scrapy.Field()              # the URI that was fetched
     network = scrapy.Field()          # "clearnet" | "tor" | "i2p"
     job_id = scrapy.Field()           # token the engine passes in, so it can find THIS job's record
+    is_seed = scrapy.Field()          # True for original seed URL, False for child pages
 
     # Provenance / metadata
     fetch_timestamp = scrapy.Field()  # ISO8601 UTC

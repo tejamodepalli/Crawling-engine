@@ -161,6 +161,12 @@ class SingleSourceSpider(scrapy.Spider):
         item["job_id"] = self.job_id
         item["url"] = url
 
+        # Preserve whether this result belongs to the
+        # original seed URL or to a discovered child page.
+        item["is_seed"] = bool(
+            meta.get("is_seed", False)
+        )
+
         item["network"] = meta.get(
             "network",
             "clearnet",

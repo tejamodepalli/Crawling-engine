@@ -161,6 +161,10 @@ def _find_record(
 ) -> dict | None:
     """
     Read only the part of crawl_results.jsonl written by this job.
+
+    When a job contains both seed and child-page records, prefer
+    the seed record so validator state comes from the original
+    source URL.
     """
 
     try:
@@ -177,6 +181,7 @@ def _find_record(
     needle = job_id.encode()
 
     found = None
+    seed_found = None
 
     for line in data.splitlines():
 
@@ -191,8 +196,16 @@ def _find_record(
         except json.JSONDecodeError:
             continue
 
-        if record.get("job_id") == job_id:
-            found = record
+        if record.get("job_id") != job_id:
+            continue
+
+        found = record
+
+        if record.get("is_seed") is True:
+            seed_found = record
+
+    if seed_found is not None:
+        return seed_found
 
     return found
 

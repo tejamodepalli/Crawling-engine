@@ -58,6 +58,23 @@ PAGE = (
 )
 
 
+SEED_CHILD_PAGE = (
+    "<html><head><title>Seed Page</title></head>"
+    "<body><h1>Seed</h1>"
+    "<p>This is the seed page.</p>"
+    '<a href="/seed-child/child">Child Page</a>'
+    "</body></html>"
+)
+
+
+CHILD_PAGE = (
+    "<html><head><title>Child Page</title></head>"
+    "<body><h1>Child</h1>"
+    "<p>This is the child page.</p>"
+    "</body></html>"
+)
+
+
 def _hit(path):
     with HITS_LOCK:
         HITS[path] = HITS.get(path, 0) + 1
@@ -101,8 +118,6 @@ class Handler(BaseHTTPRequestHandler):
             BrokenPipeError,
             ConnectionResetError,
         ):
-            # The crawler may close a timed-out request
-            # before the mock server replies.
             return
 
     def do_GET(self):
@@ -116,6 +131,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(
                 200,
                 PAGE.encode(),
+            )
+
+        elif path == "/seed-child":
+
+            if self.headers.get(
+                "If-None-Match"
+            ) == '"seed-v1"':
+
+                self._send(
+                    304,
+                    b"",
+                    headers={
+                        "ETag": '"seed-v1"'
+                    },
+                )
+
+            else:
+
+                self._send(
+                    200,
+                    SEED_CHILD_PAGE.encode(),
+                    headers={
+                        "ETag": '"seed-v1"'
+                    },
+                )
+
+        elif path == "/seed-child/child":
+
+            self._send(
+                200,
+                CHILD_PAGE.encode(),
+                headers={
+                    "ETag": '"child-v1"'
+                },
             )
 
         elif path.startswith("/etag"):
@@ -163,7 +212,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.startswith("/flaky"):
 
-            # 503 twice, then OK.
             if n <= 2:
 
                 self._send(
@@ -180,7 +228,6 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path.startswith("/ratelimit"):
 
-            # 429 once with Retry-After, then OK.
             if n == 1:
 
                 self._send(
@@ -422,10 +469,6 @@ def main():
         "FUNCTIONAL TESTS"
     )
 
-    # -------------------------------------------------------------- #
-    # Success path
-    # -------------------------------------------------------------- #
-
     holder = {}
 
     def t_ok():
@@ -461,10 +504,6 @@ def main():
         t_ok,
     )
 
-    # -------------------------------------------------------------- #
-    # Deduplication
-    # -------------------------------------------------------------- #
-
     def t_dup():
 
         r = run_crawl(
@@ -484,10 +523,6 @@ def main():
         "dedup: same content detected",
         t_dup,
     )
-
-    # -------------------------------------------------------------- #
-    # Normal 304 unchanged test
-    # -------------------------------------------------------------- #
 
     def t_304():
 
@@ -545,26 +580,6 @@ def main():
         "incremental: ETag -> 304 unchanged",
         t_304,
     )
-
-    # -------------------------------------------------------------- #
-    # NEW WEEK 7 REGRESSION TEST
-    #
-    # Finding #1 from the Error and Fix report:
-    #
-    # A 304 must NOT be accepted as unchanged when the previous
-    # HTML/text evidence files are missing.
-    #
-    # Expected behavior:
-    #
-    # 1. First request -> 200 + ETag
-    # 2. Remove previous HTML/TXT evidence
-    # 3. Second request -> 304
-    # 4. Spider detects missing evidence
-    # 5. Spider makes unconditional request
-    # 6. Server returns 200
-    # 7. Fresh HTML/TXT evidence is stored
-    # 8. Final result is success, NOT unchanged
-    # -------------------------------------------------------------- #
 
     def t_304_missing_evidence():
 
@@ -628,12 +643,6 @@ def main():
             "prev_hash": first_hash,
         }
 
-        # ---------------------------------------------------------- #
-        # Simulate Vatsal's reported failure:
-        # previous evidence is missing, but the server still
-        # returns 304 because the ETag matches.
-        # ---------------------------------------------------------- #
-
         os.remove(first_html)
         os.remove(first_text)
 
@@ -648,14 +657,6 @@ def main():
                 False,
                 "could not remove previous TXT evidence",
             )
-
-        # ---------------------------------------------------------- #
-        # Run the incremental crawl.
-        #
-        # Expected:
-        # 304 -> missing evidence detected
-        # -> unconditional request -> 200
-        # ---------------------------------------------------------- #
 
         second = run_crawl(
             src(
@@ -705,9 +706,77 @@ def main():
         t_304_missing_evidence,
     )
 
-    # -------------------------------------------------------------- #
-    # Failure handling
-    # -------------------------------------------------------------- #
+    def t_seed_validator():
+
+        first = run_crawl(
+            src(
+                "v_seed_child",
+                f"{base}/seed-child",
+            )
+        )
+
+        seed_etag = first.get(
+            "etag"
+        )
+
+        seed_flag = first.get(
+            "is_seed"
+        )
+
+        if seed_etag != '"seed-v1"':
+            return (
+                False,
+                f"expected seed ETag "
+                f'"seed-v1", got {seed_etag}',
+            )
+
+        if seed_flag is not True:
+            return (
+                False,
+                f"expected is_seed=True, "
+                f"got {seed_flag}",
+            )
+
+        validators = {
+            "etag": seed_etag,
+            "last_modified": first.get(
+                "last_modified"
+            ),
+            "prev_hash": first.get(
+                "content_hash"
+            ),
+        }
+
+        second = run_crawl(
+            src(
+                "v_seed_child",
+                f"{base}/seed-child",
+            ),
+            validators,
+        )
+
+        good = (
+            second.get("is_seed") is True
+            and second.get("etag")
+            == '"seed-v1"'
+            and second.get("http_status")
+            == 304
+            and second.get("unchanged") is True
+        )
+
+        return (
+            good,
+            f"first_etag={seed_etag} "
+            f"first_is_seed={seed_flag} "
+            f"second_etag={second.get('etag')} "
+            f"second_http={second.get('http_status')} "
+            f"second_unchanged={second.get('unchanged')}",
+        )
+
+    case(
+        "incremental: seed validator preferred over child",
+        t_seed_validator,
+    )
 
     case(
         "failure: 404 -> permanent (no retry)",
@@ -744,10 +813,6 @@ def main():
             ),
         ),
     )
-
-    # -------------------------------------------------------------- #
-    # Retry handling
-    # -------------------------------------------------------------- #
 
     def t_flaky():
 
@@ -789,10 +854,6 @@ def main():
         "retry: 429 Retry-After recovers",
         t_429,
     )
-
-    # -------------------------------------------------------------- #
-    # Empty pages
-    # -------------------------------------------------------------- #
 
     def t_empty():
 
@@ -871,10 +932,6 @@ def main():
         "empty: blank-body 200 page is flagged",
         t_blank,
     )
-
-    # -------------------------------------------------------------- #
-    # Slow cases
-    # -------------------------------------------------------------- #
 
     if not args.quick:
 
@@ -979,7 +1036,7 @@ def main():
             2,
         )
 
-        n = 8
+        n = 24
         workers = 4
 
         t0 = time.time()
@@ -988,7 +1045,7 @@ def main():
             max_workers=workers
         ) as pool:
 
-            list(
+            results = list(
                 pool.map(
                     lambda i: run_crawl(
                         src(
@@ -1002,6 +1059,14 @@ def main():
 
         wall = time.time() - t0
 
+        completed = len(results)
+
+        if completed != n:
+            raise RuntimeError(
+                f"throughput incomplete: "
+                f"{completed}/{n} jobs completed"
+            )
+
         thr.update(
             jobs=n,
             parallel_workers=workers,
@@ -1013,6 +1078,7 @@ def main():
                 n / wall * 60,
                 1,
             ),
+            completed_jobs=completed,
         )
 
         print(
@@ -1023,7 +1089,16 @@ def main():
             f"({thr['jobs_per_minute']} jobs/min)"
         )
 
+        record(
+            "throughput: concurrent jobs complete",
+            True,
+            f"{completed}/{n} jobs completed",
+            wall,
+        )
+
     except Exception as exc:
+
+        elapsed = time.time() - t0
 
         thr["error"] = (
             f"{type(exc).__name__}: {exc}"
@@ -1032,6 +1107,13 @@ def main():
         print(
             "  throughput run failed:",
             thr["error"],
+        )
+
+        record(
+            "throughput: concurrent jobs complete",
+            False,
+            thr["error"],
+            elapsed,
         )
 
     # -------------------------------------------------------------- #
@@ -1250,10 +1332,6 @@ def main():
                 0,
             )
 
-    # -------------------------------------------------------------- #
-    # Live sources
-    # -------------------------------------------------------------- #
-
     if args.live:
 
         print(
@@ -1290,10 +1368,6 @@ def main():
                     t_live,
                 )
 
-    # -------------------------------------------------------------- #
-    # Shutdown
-    # -------------------------------------------------------------- #
-
     srv.shutdown()
 
     failed = [
@@ -1301,10 +1375,6 @@ def main():
         for r in RESULTS
         if r["result"] == "FAIL"
     ]
-
-    # -------------------------------------------------------------- #
-    # Sample record
-    # -------------------------------------------------------------- #
 
     sample = None
 
@@ -1330,10 +1400,6 @@ def main():
     except OSError:
 
         pass
-
-    # -------------------------------------------------------------- #
-    # Final report
-    # -------------------------------------------------------------- #
 
     report = {
         "tests": RESULTS,
